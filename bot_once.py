@@ -17,7 +17,7 @@ from urllib.parse import unquote
 import feedparser
 import requests
 
-TG_TOKEN = os.environ["8033232437:AAH9Q6iLkJXw6QBu4olOSZ7-cjxKCRaHjxQ"]
+TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TG_CHANNEL = os.environ["@hatercentral1"]
 X_USERNAME = os.environ.get("X_USERNAME", "TheHateCentral2").lstrip("@")
 STATE_FILE = "state_rss.json"
