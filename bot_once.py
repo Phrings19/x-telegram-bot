@@ -1,25 +1,30 @@
 """
-X -> Telegram (pictures only) - ONE-SHOT version for GitHub Actions.
-Runs once, posts any new picture tweets, saves state_rss.json, then exits.
-GitHub triggers it every 30 minutes (see .github/workflows/bot.yml).
-
-Settings come from environment variables (GitHub Secrets), never from the code.
+X -> Telegram - ONE-SHOT version for GitHub Actions (v2)
+Posts new tweets that contain PICTURES or a PLAYABLE VIDEO.
+- Caption = tweet text with all links removed
+- No "View on X" link
+- Text-only posts are skipped (and GIFs, unless INCLUDE_GIFS = True)
+Runs once, saves state_rss.json, exits. GitHub triggers it on a schedule.
 """
 
-import html
 import json
 import os
 import re
 import sys
+import html
 from urllib.parse import unquote
 
 import feedparser
 import requests
 
-TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TG_CHANNEL = os.environ["TELEGRAM_CHANNEL"]
+TG_TOKEN = os.environ["8033232437:AAH9Q6iLkJXw6QBu4olOSZ7-cjxKCRaHjxQ"]
+TG_CHANNEL = os.environ["@hatercentral1"]
 X_USERNAME = os.environ.get("X_USERNAME", "TheHateCentral2").lstrip("@")
 STATE_FILE = "state_rss.json"
+
+INCLUDE_GIFS = False                    # True = also post GIFs (they are short looping videos)
+MAX_VIDEO_BYTES = 49 * 1024 * 1024      # Telegram bots can upload at most ~50 MB
+MAX_ATTEMPTS = 3                        # give up on a post after this many failed runs
 
 FEED_TEMPLATES = [
     "https://nitter.kareem.one/{user}/rss",
@@ -38,11 +43,12 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     ),
-    "Accept": "application/rss+xml, application/xml, text/xml, */*",
+    "Accept": "*/*",
 }
 STATUS_RE = re.compile(r"/status/(\d+)")
 
 
+# ---------- state ----------
 def load_state():
     try:
         with open(STATE_FILE) as f:
@@ -51,11 +57,12 @@ def load_state():
         return {}
 
 
-def save_state(seen):
+def save_state(seen, fails):
     with open(STATE_FILE, "w") as f:
-        json.dump({"seen": sorted(seen, key=int)[-300:]}, f)
+        json.dump({"seen": sorted(seen, key=int)[-300:], "fails": fails}, f)
 
 
+# ---------- feed ----------
 def fetch_feed():
     for template in FEED_TEMPLATES:
         url = template.format(user=X_USERNAME)
@@ -84,6 +91,7 @@ def is_repost_or_reply(entry):
     return entry.get("title", "").startswith(("RT by", "R to", "RT @"))
 
 
+# ---------- caption (links removed) ----------
 def html_to_text(raw):
     raw = re.sub(r"<br\s*/?>", "\n", raw, flags=re.I)
     raw = re.sub(r"</p>", "\n", raw, flags=re.I)
@@ -91,64 +99,160 @@ def html_to_text(raw):
     return html.unescape(raw).strip()
 
 
-def get_photos(entry):
-    """Photo URLs only; [] if the post has a video or GIF."""
+def clean_caption(entry):
+    text = html_to_text(entry.get("summary", "") or entry.get("title", ""))
+    text = re.sub(r"(?:https?://|www\.)\S+", "", text)                 # full links
+    text = re.sub(r"\bpic\.(?:twitter|x)\.com/\S+", "", text)           # pic.twitter.com/...
+    text = re.sub(r"\b[\w-]+\.(?:com|net|org|io|co|me|ly|gg|tv|be)/\S*", "", text)  # bare domains
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = "\n".join(line.strip() for line in text.splitlines()).strip()
+    return text[:1000]
+
+
+# ---------- finding the media ----------
+def fx_media(pid):
+    """Ask the free FxTwitter API for the post's photos/video. Returns dict or None."""
+    try:
+        r = requests.get(f"https://api.fxtwitter.com/{X_USERNAME}/status/{pid}",
+                         headers=HEADERS, timeout=30)
+        if r.status_code != 200:
+            print(f"[fxtwitter] {pid} -> HTTP {r.status_code}")
+            return None
+        data = r.json()
+    except (requests.RequestException, ValueError) as e:
+        print(f"[fxtwitter] {pid} -> {type(e).__name__}")
+        return None
+
+    tweet = data.get("tweet") or data.get("status") or {}
+    media = tweet.get("media") or {}
+    photos = [p["url"] for p in media.get("photos", []) if p.get("url")]
+    video, has_gif = None, False
+    for v in media.get("videos", []):
+        if v.get("type") == "gif" and not INCLUDE_GIFS:
+            has_gif = True
+            continue
+        if v.get("url"):
+            video = v
+            break
+    return {"photos": photos, "video": video, "gif": has_gif}
+
+
+def rss_media(entry):
+    """Fallback: read photos / video links straight from the RSS item."""
     summary = entry.get("summary", "")
-    if re.search(r"<video", summary, flags=re.I):
-        return []
-    photos = []
+    photos, video_urls = [], []
+    has_video = bool(re.search(r"<video", summary, flags=re.I))
+
     for src in re.findall(r'<img[^>]+src="([^"]+)"', summary):
         decoded = unquote(src)
         if "video" in decoded.lower():
-            return []
-        if "/media/" in decoded:
+            has_video = True
+        elif "/media/" in decoded:
             photos.append(src)
-    return photos
+
+    for src in re.findall(r'<(?:video|source)\b[^>]*?\bsrc="([^"]+)"', summary, flags=re.I):
+        m = re.search(r"/video/[^/]+/(.+)$", src)
+        if m:
+            video_urls.append(unquote(m.group(1)))  # direct video.twimg.com link
+        video_urls.append(src)
+
+    video = {"url": video_urls[0], "fallbacks": video_urls[1:]} if video_urls else None
+    return {"photos": [] if has_video else photos, "video": video,
+            "gif": False, "video_seen": has_video}
 
 
-def download(url):
+def get_media(pid, entry):
+    fx = fx_media(pid)
+    if fx and (fx["photos"] or fx["video"] or fx["gif"]):
+        return fx
+    rss = rss_media(entry)  # FxTwitter failed or found nothing -> check the RSS item too
+    if rss["video_seen"] and not rss["video"]:
+        print(f"[media] {pid}: video detected but no download link available")
+    return rss
+
+
+# ---------- download / upload ----------
+def download(url, limit=None):
+    """Returns (bytes_or_None, status) where status is ok / big / fail."""
     try:
-        r = requests.get(url, headers=HEADERS, timeout=60)
-        if r.status_code == 200 and r.content:
-            return r.content
-        print(f"[image] {url} -> HTTP {r.status_code}")
+        with requests.get(url, headers=HEADERS, timeout=120, stream=True) as r:
+            if r.status_code != 200:
+                print(f"[download] {url[:80]} -> HTTP {r.status_code}")
+                return None, "fail"
+            size = int(r.headers.get("Content-Length") or 0)
+            if limit and size > limit:
+                return None, "big"
+            chunks, total = [], 0
+            for chunk in r.iter_content(1 << 20):
+                chunks.append(chunk)
+                total += len(chunk)
+                if limit and total > limit:
+                    return None, "big"
+            return (b"".join(chunks), "ok") if total else (None, "fail")
     except requests.RequestException as e:
-        print(f"[image] {url} -> {type(e).__name__}")
-    return None
+        print(f"[download] {url[:80]} -> {type(e).__name__}")
+        return None, "fail"
 
 
-def send_photos(photos, caption):
-    caption = caption[:1000]
-    files = [d for d in (download(u) for u in photos[:10]) if d]
-    if not files:
-        return False
-
-    if len(files) == 1:
-        payload = {"chat_id": TG_CHANNEL}
-        if caption:
-            payload.update(caption=caption, parse_mode="HTML")
-        r = requests.post(f"{TG_API}/sendPhoto", data=payload,
-                          files={"photo": ("photo.jpg", files[0])}, timeout=120)
-    else:
-        media, upload = [], {}
-        for i, data in enumerate(files):
-            item = {"type": "photo", "media": f"attach://p{i}"}
-            if i == 0 and caption:
-                item.update(caption=caption, parse_mode="HTML")
-            media.append(item)
-            upload[f"p{i}"] = (f"p{i}.jpg", data)
-        r = requests.post(f"{TG_API}/sendMediaGroup",
-                          data={"chat_id": TG_CHANNEL, "media": json.dumps(media)},
-                          files=upload, timeout=180)
-
+def tg_post(method, data, files):
+    r = requests.post(f"{TG_API}/{method}", data=data, files=files, timeout=300)
     if not r.ok:
-        print(f"[telegram] error {r.status_code}: {r.text}")
+        print(f"[telegram] {method} error {r.status_code}: {r.text}")
     return r.ok
 
 
+def send_photos(photos, caption):
+    files = [d for d in (download(u)[0] for u in photos[:10]) if d]
+    if not files:
+        return "fail"
+    if len(files) == 1:
+        data = {"chat_id": TG_CHANNEL}
+        if caption:
+            data["caption"] = caption
+        ok = tg_post("sendPhoto", data, {"photo": ("photo.jpg", files[0])})
+    else:
+        media, upload = [], {}
+        for i, blob in enumerate(files):
+            item = {"type": "photo", "media": f"attach://p{i}"}
+            if i == 0 and caption:
+                item["caption"] = caption
+            media.append(item)
+            upload[f"p{i}"] = (f"p{i}.jpg", blob)
+        ok = tg_post("sendMediaGroup",
+                     {"chat_id": TG_CHANNEL, "media": json.dumps(media)}, upload)
+    return "ok" if ok else "fail"
+
+
+def send_video(video, caption):
+    candidates = [video["url"]] + list(video.get("fallbacks", []))
+    blob, status = None, "fail"
+    for url in candidates:
+        blob, status = download(url, MAX_VIDEO_BYTES)
+        if blob or status == "big":
+            break
+    if status == "big":
+        print("[video] larger than Telegram's 50 MB bot limit - skipped")
+        return "skip"
+    if not blob:
+        return "fail"
+
+    data = {"chat_id": TG_CHANNEL, "supports_streaming": "true"}
+    if caption:
+        data["caption"] = caption
+    for key in ("width", "height", "duration"):
+        if video.get(key):
+            data[key] = str(int(video[key]))
+    ok = tg_post("sendVideo", data, {"video": ("video.mp4", blob)})
+    return "ok" if ok else "fail"
+
+
+# ---------- main ----------
 def main():
     state = load_state()
     seen = set(state.get("seen", []))
+    fails = state.get("fails", {})
+
     entries = fetch_feed()
     if not entries:
         return
@@ -159,7 +263,7 @@ def main():
             pid = entry_id(e)
             if pid:
                 seen.add(pid)
-        save_state(seen)
+        save_state(seen, {})
         print("Initialised. Only new posts from now on will be forwarded.")
         return
 
@@ -168,25 +272,42 @@ def main():
     new.sort(key=lambda x: int(x[0]))
 
     for pid, e in new:
-        photos = get_photos(e)
-        if not photos:
-            print(f"Skipped {pid} (no photo, or has video/GIF)")
-            ok = True
+        media = get_media(pid, e)
+        n_photos = len(media["photos"])
+        print(f"[media] {pid}: {n_photos} photo(s), video={'yes' if media['video'] else 'no'}, "
+              f"gif={'yes' if media.get('gif') else 'no'}")
+
+        caption = clean_caption(e)
+        if media["video"]:
+            result = send_video(media["video"], caption)
+        elif media["photos"]:
+            result = send_photos(media["photos"], caption)
         else:
-            caption = html.escape(html_to_text(e.get("summary", "") or e.get("title", "")))
-            ok = send_photos(photos, caption)
-            if ok:
-                print(f"Forwarded {pid}")
-        if ok:
+            print(f"Skipped {pid} (no picture or video)")
+            result = "skip"
+
+        if result == "ok":
+            print(f"Forwarded {pid}")
+
+        if result in ("ok", "skip"):
             seen.add(pid)
-            save_state(seen)
+            fails.pop(pid, None)
+            save_state(seen, fails)
         else:
+            fails[pid] = fails.get(pid, 0) + 1
+            if fails[pid] >= MAX_ATTEMPTS:
+                print(f"Giving up on {pid} after {MAX_ATTEMPTS} failed runs")
+                seen.add(pid)
+                fails.pop(pid, None)
+                save_state(seen, fails)
+                continue
+            save_state(seen, fails)
             break  # retry next run, keep order
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as exc:  # don't mark the workflow red for temporary glitches
+    except Exception as exc:  # don't turn the workflow red for temporary glitches
         print(f"Run failed: {exc}")
         sys.exit(0)
