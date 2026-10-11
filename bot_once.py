@@ -18,7 +18,7 @@ import feedparser
 import requests
 
 TG_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TG_CHANNEL = os.environ["@hatercentral1"]
+TG_CHANNEL = os.environ["TELEGRAM_CHANNEL"]
 X_USERNAME = os.environ.get("X_USERNAME", "TheHateCentral2").lstrip("@")
 STATE_FILE = "state_rss.json"
 
